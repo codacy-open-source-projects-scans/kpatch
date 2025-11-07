@@ -33,13 +33,14 @@
 # - Builds the patched kernel/module and monitors changed objects
 # - Builds the patched objects with gcc flags -f[function|data]-sections
 # - Runs kpatch tools to create and link the patch kernel module
-VERSION=0.9.9
+VERSION=0.9.11
 
 set -o pipefail
 
 BASE="$PWD"
 SCRIPTDIR="$(readlink -f "$(dirname "$(type -p "$0")")")"
 ARCH="$(uname -m)"
+TARGET_ARCH="${TARGET_ARCH:-$ARCH}"
 CPUS="$(getconf _NPROCESSORS_ONLN)"
 CACHEDIR="${CACHEDIR:-$HOME/.kpatch}"
 KERNEL_SRCDIR="$CACHEDIR/src"
@@ -80,6 +81,7 @@ declare -rA SUPPORTED_RPM_DISTROS=(
 	["ol"]="Oracle"
 	["photon"]="Photon OS"
 	["rhel"]="RHEL"
+	["almalinux"]="AlmaLinux"
 	["amzn"]="Amazon Linux")
 
 
@@ -275,6 +277,14 @@ support_klp_replace()
 	fi
 }
 
+check_paravirt() {
+	if kernel_is_rhel; then
+		! rhel_kernel_version_gte 5.14.0-582.el9
+	else
+		! kernel_version_gte 6.8.0
+	fi
+}
+
 find_dirs() {
 	if [[ -e "$SCRIPTDIR/create-diff-object" ]]; then
 		# git repo
@@ -381,16 +391,19 @@ find_special_section_data() {
 	check[e]=true						# exception_table_entry
 
 	# Arch-specific features
-	case "$ARCH" in
+	case "$TARGET_ARCH" in
 		"x86_64")
 			check[a]=true					# alt_instr
 			kernel_version_gte 5.10.0 && check[s]=true	# static_call_site
-			[[ -n "$CONFIG_PARAVIRT" ]] && ! kernel_version_gte 6.8.0 && check[p]=true	# paravirt_patch_site
+			[[ -n "$CONFIG_PARAVIRT" ]] && check_paravirt && check[p]=true	# paravirt_patch_site
 			;;
 		"ppc64le")
 			check[f]=true					# fixup_entry
 			;;
 		"s390x")
+			check[a]=true					# alt_instr
+			;;
+		"aarch64")
 			check[a]=true					# alt_instr
 			;;
 	esac
@@ -710,6 +723,15 @@ print_supported_distro(){
 	fi
 }
 
+# Used in "make ARCH=xxx" when making the kernel.
+# Match "aarch64" to "arm64", while keep everything else the same.
+kernel_make_arch() {
+	if [[ "$1" == "aarch64" ]]; then
+		echo "arm64"
+	else
+		echo "$1"
+	fi
+}
 
 usage() {
 	echo "usage: $(basename "$0") [options] <patch1 ... patchN>" >&2
@@ -843,6 +865,13 @@ if [[ ${#PATCH_LIST[@]} -eq 0 ]]; then
 fi
 
 trace_on
+# Don't check external file.
+# shellcheck disable=SC1090
+if [[ -z "$USERSRCDIR" ]] && [[ -f "$RELEASE_FILE" ]]; then
+	source "$RELEASE_FILE"
+	DISTRO="$ID"
+fi
+
 
 if [[ -n "$SRCRPM" ]]; then
 	if  [[ -n "$ARCHVERSION" ]]; then
@@ -850,9 +879,14 @@ if [[ -n "$SRCRPM" ]]; then
 		exit 1
 	fi
 	rpmname="$(basename "$SRCRPM")"
-	ARCHVERSION="${rpmname%.src.rpm}.$(uname -m)"
+	if [[ "$DISTRO" = photon ]]; then
+		ARCHVERSION="${rpmname%.src.rpm}"
+	else
+		ARCHVERSION="${rpmname%.src.rpm}.$(uname -m)"
+	fi
 	ARCHVERSION="${ARCHVERSION#kernel-}"
 	ARCHVERSION="${ARCHVERSION#alt-}"
+	ARCHVERSION="${ARCHVERSION#linux-}"
 fi
 
 if [[ -n "$OOT_MODULE" ]] &&  [[ -z "$OOT_MODULE_SRCDIR" ]]; then
@@ -902,13 +936,6 @@ fi
 
 [[ "$SKIPCLEANUP" -eq 0 ]] && trap cleanup EXIT INT TERM HUP
 
-# Don't check external file.
-# shellcheck disable=SC1090
-if [[ -z "$USERSRCDIR" ]] && [[ -f "$RELEASE_FILE" ]]; then
-	source "$RELEASE_FILE"
-	DISTRO="$ID"
-fi
-
 KVER="${ARCHVERSION%%-*}"
 if [[ "$ARCHVERSION" =~ - ]]; then
 	# handle flavor extension on Photon ex) -rt, -esx
@@ -920,12 +947,12 @@ if [[ "$ARCHVERSION" =~ - ]]; then
 		KREL="${KREL%-*}"
 		KREL="${KREL#*-}"
 
-		PH_TAG="${ARCHVERSION##*.}"
-		PH_FLAVOR="${PH_TAG##*-}"
-		PH_TAG="${PH_TAG%%-*}"
-
-		# if no flavor, these will be the same
-		[[ "$PH_FLAVOR" = "$PH_TAG" ]] && PH_FLAVOR=""
+		PH_TAG=$(echo "$ARCHVERSION" | grep -oE 'ph[0-9]+')
+		if [[ "$ARCHVERSION" =~ (^|[-\.])(rt|esx|aws)($|[-\.]) ]]; then
+			PH_FLAVOR="${BASH_REMATCH[2]}"
+		else
+			PH_FLAVOR=""
+		fi
 	else
 		KREL="${ARCHVERSION##*-}"
 	fi
@@ -984,7 +1011,7 @@ else
 		echo "Downloading kernel source for $ARCHVERSION"
 		if [[ -z "$SRCRPM" ]]; then
 			if [[ "$DISTRO" = fedora ]]; then
-				wget -P "$TEMPDIR" "http://kojipkgs.fedoraproject.org/packages/kernel/$KVER/$KREL/src/kernel-$KVER-$KREL.src.rpm" 2>&1 | logger || die
+				wget -P "$TEMPDIR" "https://kojipkgs.fedoraproject.org/packages/kernel/$KVER/$KREL/src/kernel-$KVER-$KREL.src.rpm" 2>&1 | logger || die
 			elif [[ "$DISTRO" = photon ]]; then
 				if [[ -n "$PH_FLAVOR" ]]; then
 					SRC_RPM_NAME="linux-$PH_FLAVOR-$KVER-$KREL.$PH_TAG.src.rpm"
@@ -1003,11 +1030,9 @@ else
 			if [ -z "$SRCRPM" ]; then
 				SRCRPM="$TEMPDIR/kernel$ALT-$KVER-$KREL.src.rpm"
 			fi
-
 		fi
 
 		echo "Unpacking kernel source"
-
 		if [[ "$DISTRO" = photon ]]; then
 			[[ -n "$PH_FLAVOR" ]] && SPECNAME="linux-$PH_FLAVOR.spec" || SPECNAME="linux.spec"
 		else
@@ -1018,7 +1043,7 @@ else
 
 		# Define dist tag to handle rpmbuild of the linux src rpm in Photon
 		if [[ "$DISTRO" = photon ]] && [ "$(rpm -E %dist)" = "%dist" ]; then
-			sed -i "1s/^/%define dist .$PH_TAG/" "$RPMTOPDIR"/SPECS/"$SPECNAME"
+			sed -i "1s|^|%define dist .$PH_TAG\n\n|" "$RPMTOPDIR"/SPECS/"$SPECNAME"
 		fi
 
 		rpmbuild -D "_topdir $RPMTOPDIR" -bp --nodeps "--target=$(uname -m)" "$RPMTOPDIR"/SPECS/"$SPECNAME" 2>&1 | logger || die "rpmbuild -bp failed.  you may need to run 'yum-builddep kernel' first."
@@ -1030,19 +1055,6 @@ else
 		elif [[ "$DISTRO" = opencloudos ]]; then
 			mv "$RPMTOPDIR"/BUILD/kernel-*/kernel-* "$KERNEL_SRCDIR" 2>&1 | logger || die
 		elif [[ "$DISTRO" = photon ]]; then
-			# Photon has some files that are copied over during the build section of the spec file (instead of prep)
-			# These change occasionally, so check they exist before copying
-			ls "$RPMTOPDIR"/BUILD/fips*canister* &> /dev/null && ( cp -rT "$RPMTOPDIR"/BUILD/fips*canister* "$RPMTOPDIR"/BUILD/linux-"$KVER"/crypto | logger || die )
-			[[ -f "$RPMTOPDIR"/SOURCES/fips_canister-kallsyms ]] && ( cp "$RPMTOPDIR"/SOURCES/fips_canister-kallsyms rpmbuild/BUILD/linux-"$KVER"/crypto | logger || die )
-
-			if [[ -z "$CONFIGFILE" ]]; then
-				# Photon has multiple config files per src rpm sometimes, and naming is not consistent.
-				# So do our best to find the right one by parsing the spec file
-				SRC_CFG=$(rpmspec -P -D "_topdir $RPMTOPDIR" "$RPMTOPDIR"/SPECS/"$SPECNAME" | awk '/^cp .*\/SOURCES\/config.* \.config$/{print $2}')
-				[[ -z "$SRC_CFG" ]] && die "Failed to locate kernel config file"
-				SRC_CFG="${SRC_CFG##*/}"
-				cp "$RPMTOPDIR"/SOURCES/"$SRC_CFG" "$RPMTOPDIR"/BUILD/linux-"$KVER" | logger || die
-			fi
 			mv "$RPMTOPDIR"/BUILD/linux-"$KVER" "$KERNEL_SRCDIR" 2>&1 | logger || die
 		else
 			mv "$RPMTOPDIR"/BUILD/kernel-*/linux-* "$KERNEL_SRCDIR" 2>&1 | logger || die
@@ -1060,20 +1072,14 @@ else
 		if [[ "$DISTRO" = openEuler ]] || [[ "$DISTRO" = opencloudos ]]; then
 			[[ -z "$CONFIGFILE" ]] && CONFIGFILE="/boot/config-${ARCHVERSION}"
 		elif [[ "$DISTRO" = photon ]]; then
-			[[ -z "$CONFIGFILE" ]] && CONFIGFILE="$KERNEL_SRCDIR/$SRC_CFG"
-
-			# modify config file here to get the right vermagic, as Photon does not always listen to localversion file
-			if [[ -z "$PH_FLAVOR" ]]; then
-				sed -i s/^CONFIG_LOCALVERSION=\".*\"/CONFIG_LOCALVERSION=\"-"$KREL"."$PH_TAG"\"/g "$CONFIGFILE" || die
-			else
-				sed -i s/^CONFIG_LOCALVERSION=\".*\"/CONFIG_LOCALVERSION=\"-"$KREL"."$PH_TAG"-"$PH_FLAVOR"\"/g "$CONFIGFILE" || die
-			fi
-
+			[[ -z "$CONFIGFILE" ]] && CONFIGFILE="$KERNEL_SRCDIR"/.config
 		else
 			[[ -z "$CONFIGFILE" ]] && CONFIGFILE="$KERNEL_SRCDIR/configs/kernel$ALT-$KVER-$ARCH.config"
 		fi
+		if [[ ! "$DISTRO" = photon ]]; then
+			(cd "$KERNEL_SRCDIR" && make mrproper 2>&1 | logger) || die
+		fi
 
-		(cd "$KERNEL_SRCDIR" && make mrproper 2>&1 | logger) || die
 
 	elif is_supported_deb_distro "$DISTRO"; then
 
@@ -1287,6 +1293,11 @@ else
 	MAKEVARS+=("LD=${KPATCH_CC_PREFIX}${LD}")
 fi
 
+if [[ "$ARCH" != "$TARGET_ARCH" ]]; then
+	KARCH=$(kernel_make_arch "$TARGET_ARCH")
+	MAKEVARS+=("ARCH=$KARCH")
+fi
+
 
 # $TARGETS used as list, no quotes.
 # shellcheck disable=SC2086
@@ -1391,7 +1402,7 @@ for i in $FILES; do
 	# In RHEL 7 based kernels, copy_user_64.o misuses the .fixup section,
 	# which confuses create-diff-object.  It's fine to skip it, it's an
 	# assembly file anyway.
-	[[ "$DISTRO" = rhel ]] || [[ "$DISTRO" = centos ]] || [[ "$DISTRO" = ol ]] && \
+	[[ "$DISTRO" = rhel ]] || [[ "$DISTRO" = centos ]] || [[ "$DISTRO" = almalinux ]] || [[ "$DISTRO" = ol ]] && \
 		[[ "$i" = arch/x86/lib/copy_user_64.o ]] && continue
 
 	[[ "$i" = usr/initramfs_data.o ]] && continue
@@ -1477,7 +1488,12 @@ fi
 cd "$TEMPDIR/output" || die
 # $KPATCH_LDFLAGS and result of find used as list, no quotes.
 # shellcheck disable=SC2086,SC2046
-"$LD" -r $KPATCH_LDFLAGS -o ../patch/tmp_output.o $(find . -name "*.o") 2>&1 | logger || die
+if [[ "$ARCH" != "$TARGET_ARCH" ]]; then
+	# if cross compiling, use LLD to link
+	"$LLD" -r $KPATCH_LDFLAGS -o ../patch/tmp_output.o $(find . -name "*.o") 2>&1 | logger || die
+else
+	"$LD" -r $KPATCH_LDFLAGS -o ../patch/tmp_output.o $(find . -name "*.o") 2>&1 | logger || die
+fi
 
 if [[ "$USE_KLP" -eq 1 ]]; then
 	cp -f "$TEMPDIR"/patch/tmp_output.o "$TEMPDIR"/patch/output.o || die

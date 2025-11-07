@@ -1,0 +1,69 @@
+_:
+  common-upstream-kernel-test-config: &common-upstream-kernel-test-config
+    job: tests
+    branch: master
+    identifier: "integration-upstream"
+    use_internal_tf: true
+    targets:
+      # [NOTE] There needs to be a matching target among the Copr targets,
+      # because of the default mapping and filtering (to avoid invalid values).
+      # In this case (no build), it is a bug, see packit/packit-service#2841
+      # Yet, the `rawhide` has no effect as there is no Copr build happening.
+      fedora-rawhide-x86_64:
+        distros: [Fedora-37-Updated]
+      fedora-rawhide-s390x:
+        distros: [Fedora-37-Updated]
+      fedora-rawhide-ppc64le:
+        distros: [Fedora-37-Updated]
+    skip_build: true
+    manual_trigger: false
+    tmt_plan: kpatch-integration-upstream
+    fmf_url: https://gitlab.com/redhat/centos-stream/tests/kernel/test-plans.git
+    fmf_ref: main
+
+  common-rhel-test-config: &common-rhel-test-config
+    job: tests
+    branch: master
+    identifier: "integration-rhel"
+    use_internal_tf: true
+    targets:
+      # Same as above, need a public copr chroot target. Use `copr-cli list` to
+      # list all of the available public copr chroots.
+      epel-8-x86_64:
+        distros: [RHEL-8.10.0-Nightly, RHEL-8.8.0-Nightly, RHEL-8.6.0-Nightly, RHEL-8.4.0-Nightly]
+      epel-9-x86_64:
+        distros: [RHEL-9.7.0-Nightly, RHEL-9.6.0-Nightly, RHEL-9.4.0-Nightly, RHEL-9.2.0-Nightly, RHEL-9.0.0-Nightly]
+      epel-8-ppc64le:
+        distros: [RHEL-8.10.0-Nightly, RHEL-8.8.0-Nightly, RHEL-8.6.0-Nightly, RHEL-8.4.0-Nightly]
+      epel-9-ppc64le:
+        distros: [RHEL-9.7.0-Nightly, RHEL-9.6.0-Nightly, RHEL-9.4.0-Nightly, RHEL-9.2.0-Nightly, RHEL-9.0.0-Nightly]
+      # rhel+epel-10-ppc64le:
+      #   distros: [RHEL-10.0-Nightly]
+    skip_build: true
+    manual_trigger: false
+    tmt_plan: kpatch-integration-rhel
+    fmf_url: https://gitlab.com/redhat/centos-stream/tests/kernel/test-plans.git
+    fmf_ref: main
+
+jobs:
+  - <<: *common-upstream-kernel-test-config
+    # [NOTE] Runs only for PRs to be merged into `master`
+    trigger: pull_request
+    labels:
+      - integration-pr
+
+  - <<: *common-upstream-kernel-test-config
+    trigger: commit
+    labels:
+      - integration-commit
+
+  - <<: *common-rhel-test-config
+    # [NOTE] Runs only for PRs to be merged into `master`
+    trigger: pull_request
+    labels:
+      - integration-pr
+
+  - <<: *common-rhel-test-config
+    trigger: commit
+    labels:
+      - integration-commit

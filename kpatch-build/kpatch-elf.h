@@ -116,6 +116,7 @@ enum architecture {
 	PPC64  = 0x1 << 0,
 	X86_64 = 0x1 << 1,
 	S390   = 0x1 << 2,
+	AARCH64  = 0x1 << 3,
 };
 
 struct kpatch_elf {
@@ -127,6 +128,9 @@ struct kpatch_elf {
 	Elf_Data *symtab_shndx;
 	int fd;
 	bool has_pfe;
+	bool pfe_ordered;
+	int modinfo_data_len;
+	char *modinfo_data;
 };
 
 /*******************
@@ -135,6 +139,7 @@ struct kpatch_elf {
 char *status_str(enum status status);
 bool is_rela_section(struct section *sec);
 bool is_text_section(struct section *sec);
+bool is_patchable_function_entries_section(struct section *sec);
 bool is_debug_section(struct section *sec);
 
 struct section *find_section_by_index(struct list_head *list, unsigned int index);
@@ -180,6 +185,8 @@ void print_strtab(char *buf, size_t size);
 void kpatch_create_shstrtab(struct kpatch_elf *kelf);
 void kpatch_create_strtab(struct kpatch_elf *kelf);
 void kpatch_create_symtab(struct kpatch_elf *kelf);
+struct section *create_section(struct kpatch_elf *kelf, char *name,
+                               int entsize, int nr);
 struct section *create_section_pair(struct kpatch_elf *kelf, char *name,
                                     int entsize, int nr);
 void kpatch_remove_and_free_section(struct kpatch_elf *kelf, char *secname);

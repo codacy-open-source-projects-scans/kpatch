@@ -1886,6 +1886,23 @@ static void kpatch_verify_patchability(struct kpatch_elf *kelf)
 		DIFF_FATAL("%d unsupported section change(s)", errs);
 }
 
+/*
+ * Do not perform symbol inclusion initially from .rela__bug_table.
+ *
+ * WARN() is converted to a static call which emits relocations that point
+ * directly into __bug_table+off. If the usual "include every symbol referenced
+ * by this rela section" rule is applied here, it could end up dragging in the
+ * entire __bug_table via propagation.
+ *
+ * .rela__bug_table relocations are processed later in
+ * kpatch_regenerate_special_section(), which also adjusts relocations
+ * targetting __bug_table.
+ */
+static bool kpatch_skip_symbol_inclusion_from_relasec(struct section *relasec)
+{
+	return !strcmp(relasec->name, ".rela__bug_table");
+}
+
 static void kpatch_include_symbol(struct symbol *sym);
 
 static void kpatch_include_section(struct section *sec)
@@ -1906,6 +1923,8 @@ static void kpatch_include_section(struct section *sec)
 	if (!sec->rela)
 		return;
 	sec->rela->include = 1;
+	if (kpatch_skip_symbol_inclusion_from_relasec(sec->rela))
+		return;
 	list_for_each_entry(rela, &sec->rela->relas, list)
 		kpatch_include_symbol(rela->sym);
 }
@@ -2412,6 +2431,11 @@ static int s390_expolines_group_size(struct kpatch_elf *kelf, int offset)
 	return 4;
 }
 
+static int s390_stack_protector_loc_group_size(struct kpatch_elf *kelf, int offset)
+{
+	return 8;
+}
+
 /*
  * The rela groups in the .fixup section vary in size.  The beginning of each
  * .fixup rela group is referenced by the __ex_table section. To find the size
@@ -2738,6 +2762,11 @@ static struct special_section special_sections[] = {
 		.arch		= S390,
 		.group_size	= s390_expolines_group_size,
 	},
+	{
+		.name		= "__stack_protector_loc",
+		.arch		= S390,
+		.group_size	= s390_stack_protector_loc_group_size,
+	},
 	{},
 };
 
@@ -2791,6 +2820,44 @@ static void kpatch_update_ex_table_addend(struct kpatch_elf *kelf,
 	}
 }
 
+static bool is_reloc_to_bug_table(struct rela *rela)
+{
+	return !strcmp(rela->sym->name, "__bug_table");
+}
+
+static void recalculate_bug_table_rela_addend(struct kpatch_elf *kelf,
+					      long old_bug_offset,
+					      long new_bug_offset)
+{
+	long add_offset, old_target_offset;
+	struct section *relasec;
+	struct rela *rela;
+
+	list_for_each_entry(relasec, &kelf->sections, list) {
+		if (!is_rela_section(relasec) ||
+		    !relasec->include ||
+		    !strcmp(relasec->name, ".rela__bug_table"))
+			continue;
+		list_for_each_entry(rela, &relasec->relas, list) {
+			if (!is_reloc_to_bug_table(rela))
+				continue;
+			old_target_offset = rela_target_offset(kelf, relasec, rela);
+			if (old_target_offset == old_bug_offset) {
+				add_offset = rela_target_offset(kelf, relasec, rela) - rela->addend;
+				rela->addend = new_bug_offset - add_offset;
+				rela->rela.r_addend = rela->addend;
+				log_debug("%s: adjusting rela from %s+%lx to %s+%lx\n",
+					relasec->name,
+					rela->sym->name,
+					old_bug_offset - add_offset,
+					rela->sym->name,
+					new_bug_offset - add_offset);
+			}
+		}
+	}
+
+}
+
 static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 					      struct lookup_table *lookup,
 					      struct special_section *special,
@@ -2798,7 +2865,7 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 {
 	struct rela *rela, *safe;
 	char *src, *dest;
-	unsigned int group_size, src_offset, dest_offset;
+	unsigned int group_size, src_offset, dest_offset, new_offset;
 
 	LIST_HEAD(newrelas);
 
@@ -2852,10 +2919,25 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 				list_del(&rela->list);
 				list_add_tail(&rela->list, &newrelas);
 
+				if (!strcmp(relasec->name, ".rela__bug_table")) {
+					new_offset = rela->offset - (src_offset - dest_offset);
+					/*
+					 * When a bug table rela entry is
+					 * reassigned to a new offset
+					 * (rela->offset adjustment below),
+					 * update the addends of all
+					 * relocations targeting __bug_table so
+					 * they continue to reference the
+					 * updated bug entry.
+					 */
+					recalculate_bug_table_rela_addend(kelf, rela->offset,
+									  new_offset);
+				}
+
 				rela->offset -= src_offset - dest_offset;
 				rela->rela.r_offset = rela->offset;
 
-				rela->sym->include = 1;
+				kpatch_include_symbol(rela->sym);
 
 				if (!strcmp(special->name, ".fixup"))
 					kpatch_update_ex_table_addend(kelf, special,
@@ -2997,6 +3079,20 @@ next:
 	ip_sec->data->d_size = dest_idx * ORC_IP_PTR_SIZE;
 }
 
+static bool is_ftr_alt_fixup_reloc(struct section *relasec, struct rela *rela)
+{
+	if (!relasec->base)
+		return false;
+
+	if (strncmp(relasec->base->name, "__ftr_fixup", 11) &&
+	    strncmp(relasec->base->name, "__mmu_ftr_fixup", 15) &&
+	    strncmp(relasec->base->name, "__fw_ftr_fixup", 14))
+		return false;
+
+	return rela->sym->type == STT_SECTION &&
+		!strncmp(rela->sym->name, "__ftr_alt_", 10);
+}
+
 static void kpatch_check_relocations(struct kpatch_elf *kelf)
 {
 	struct rela *rela;
@@ -3009,6 +3105,8 @@ static void kpatch_check_relocations(struct kpatch_elf *kelf)
 			continue;
 		list_for_each_entry(rela, &relasec->relas, list) {
 			if (!rela->sym->sec)
+				continue;
+			if (is_ftr_alt_fixup_reloc(relasec, rela))
 				continue;
 
 			sec_size = rela->sym->sec->data->d_size;
